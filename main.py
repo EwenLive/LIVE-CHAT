@@ -46,26 +46,26 @@ async def websocket_endpoint(websocket: WebSocket):
 async def pop(ctx, *, texte: str = ""):
     video_url = None
     final_text = texte
+    user_name = ctx.author.display_name  # On récupère le pseudo
 
-    # 1. Vérifier s'il y a un fichier attaché (prioritaire)
     if ctx.message.attachments:
         video_url = ctx.message.attachments[0].url
-    
-    # 2. Sinon, chercher une URL dans le texte
     else:
-        # Cette regex trouve les liens commençant par http ou https
         url_match = re.search(r'(https?://\S+)', texte)
         if url_match:
             video_url = url_match.group(0)
-            # On retire l'URL du texte pour ne pas l'afficher sur l'overlay
             final_text = texte.replace(video_url, "").strip()
 
     if video_url:
-        # Envoi au client (Overlay)
-        await manager.broadcast({"url": video_url, "text": final_text})
-        await ctx.send(f"🚀 Pop envoyé ! (Source: {video_url})")
+        # On ajoute "user" dans le dictionnaire envoyé
+        await manager.broadcast({
+            "url": video_url, 
+            "text": final_text, 
+            "user": user_name 
+        })
+        await ctx.send("✅")
     else:
-        await ctx.send("⚠️ Erreur : Envoie un fichier MP4 OU un lien (YouTube/Direct) !")
+        await ctx.send("⚠️ Erreur : Envoie un fichier ou un lien !")
 
 @app.on_event("startup")
 async def startup_event():

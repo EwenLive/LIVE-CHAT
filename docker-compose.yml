@@ -1,0 +1,19 @@
+version: '3'
+services:
+  # Ton serveur Python (main.py)
+  app-server:
+    build: .
+    restart: always
+
+  # Le tunnel Ngrok qui rend ton serveur accessible
+  ngrok-tunnel:
+    image: ngrok/ngrok:latest
+    restart: always
+    environment:
+      - NGROK_AUTHTOKEN=REVOKED_TOKEN
+    command:
+      - http
+      - --domain=decomposable-untawdry-shaquana.ngrok-free.dev
+      - app-server:8000
+    depends_on:
+      - app-server

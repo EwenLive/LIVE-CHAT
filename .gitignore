@@ -1,0 +1,15 @@
+# PyInstaller (Fichiers de compilation)
+build/
+dist/
+*.spec
+
+# Python (Fichiers temporaires)
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+# Docker (si tu ne veux pas partager tes données d'instance)
+.docker-compose.persistence/
+
+.env

@@ -13,3 +13,6 @@ __pycache__/
 .docker-compose.persistence/
 
 .env
+
+ffmpeg.exe
+ffprobe.exe

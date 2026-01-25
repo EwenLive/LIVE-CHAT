@@ -4,6 +4,7 @@ services:
   app-server:
     build: .
     restart: always
+    env_file: .env
 
   # Le tunnel Ngrok qui rend ton serveur accessible
   ngrok-tunnel:

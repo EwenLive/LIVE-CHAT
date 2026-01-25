@@ -46,7 +46,7 @@ async def websocket_endpoint(websocket: WebSocket):
 async def pop(ctx, *, texte: str = ""):
     video_url = None
     final_text = texte
-    user_name = ctx.author.display_name  # On récupère le pseudo
+    user_name = ctx.author.name
 
     if ctx.message.attachments:
         video_url = ctx.message.attachments[0].url

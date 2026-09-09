@@ -16,3 +16,14 @@ __pycache__/
 
 ffmpeg.exe
 ffprobe.exe
+
+# Secrets / données perso (ne JAMAIS publier)
+cookies.txt
+discord_links.json
+channels.json
+points.json
+media/
+deploy/
+
+# VS Code Code Runner (fichier temporaire)
+tempCodeRunnerFile.py

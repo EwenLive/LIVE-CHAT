@@ -5,13 +5,16 @@ services:
     build: .
     restart: always
     env_file: .env
+    volumes:
+      # Permet d'éditer les IDs Discord à chaud, sans rebuild de l'image
+      - ./discord_links.json:/app/discord_links.json
 
   # Le tunnel Ngrok qui rend ton serveur accessible
   ngrok-tunnel:
     image: ngrok/ngrok:latest
     restart: always
     environment:
-      - NGROK_AUTHTOKEN=REVOKED_TOKEN
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
     command:
       - http
       - --domain=decomposable-untawdry-shaquana.ngrok-free.dev

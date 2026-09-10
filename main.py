@@ -51,36 +51,14 @@ def save_channels(channels: list):
     except Exception:
         pass
 
-# --- Rangs "drôle / pas drôle" (rôles Discord réels) ---
-# points >= 0 -> rôle "drôle" ; points < 0 -> rôle "pas drôle"
-POINTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "points.json")
-DROLE_ROLE_ID = int(os.getenv("DROLE_ROLE_ID", "1467500459962011658"))
-PASDROLE_ROLE_ID = int(os.getenv("PASDROLE_ROLE_ID", "1467500548210167838"))
-
-def load_points() -> dict:
-    try:
-        with open(POINTS_PATH, "r", encoding="utf-8") as f:
-            d = json.load(f)
-            return {str(k): int(v) for k, v in d.items()} if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-def save_points(points: dict):
-    try:
-        with open(POINTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(points, f)
-    except Exception:
-        pass
-
 # --- Auto-update du client ---
 # Le dossier updates/ contient : version.txt (numéro) + latest.exe (le client à jour)
 UPDATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "updates")
 
 # Suivi des alertes pour les votes (en mémoire, transitoire)
 alert_authors = {}   # alert_id -> author_discord_id
-alert_votes = {}     # alert_id -> {voter_key: value (-1/0/1)}
+alert_votes = {}     # alert_id -> {voter_key: value (-1/0/1)} ; sert à compter 👍/👎 en live
 alert_order = []     # historique borné des alert_id
-_guild = None        # guilde Discord résolue au démarrage (pour gérer les rôles)
 
 app = FastAPI()
 
@@ -256,70 +234,21 @@ class ConnectionManager:
             except Exception:
                 pass
 
-    # --- Classement (rangs) ---
-    async def build_leaderboard(self, top=15) -> list:
-        pts = load_points()
-        items = sorted(pts.items(), key=lambda kv: kv[1], reverse=True)[:top]
-        entries = []
-        for did, p in items:
-            info = await self._resolve({"discord_id": did, "name": did})
-            entries.append({"name": info["name"], "avatar": info["avatar"], "points": p, "drole": p >= 0})
-        return entries
-
-    async def broadcast_leaderboard(self):
-        await self.broadcast({"type": "leaderboard", "entries": await self.build_leaderboard()})
+    # --- Compteurs de votes 👍/👎 (live, par pop) ---
+    async def broadcast_vote_counts(self, alert_id):
+        votes = alert_votes.get(alert_id, {})
+        up = sum(1 for v in votes.values() if v > 0)
+        down = sum(1 for v in votes.values() if v < 0)
+        await self.broadcast({"type": "vote_counts", "alert_id": alert_id, "up": up, "down": down})
 
 manager = ConnectionManager()
 
-# --- Gestion des rôles Discord (drôle / pas drôle) ---
-async def _get_member(discord_id):
-    if _guild is None:
-        return None
-    try:
-        m = _guild.get_member(int(discord_id))
-        if m is None:
-            m = await _guild.fetch_member(int(discord_id))
-        return m
-    except Exception:
-        return None
-
-async def apply_rank_role(discord_id, points):
-    member = await _get_member(discord_id)
-    if member is None:
-        return
-    drole = _guild.get_role(DROLE_ROLE_ID)
-    pasdrole = _guild.get_role(PASDROLE_ROLE_ID)
-    try:
-        if points >= 0:
-            if pasdrole and pasdrole in member.roles:
-                await member.remove_roles(pasdrole, reason="LiveChat rang")
-            if drole and drole not in member.roles:
-                await member.add_roles(drole, reason="LiveChat rang")
-        else:
-            if drole and drole in member.roles:
-                await member.remove_roles(drole, reason="LiveChat rang")
-            if pasdrole and pasdrole not in member.roles:
-                await member.add_roles(pasdrole, reason="LiveChat rang")
-    except Exception as e:
-        print(f"⚠️ Gestion rôle impossible pour {discord_id}: {e}")
-
-async def clear_rank_roles(discord_id):
-    member = await _get_member(discord_id)
-    if member is None:
-        return
-    for rid in (DROLE_ROLE_ID, PASDROLE_ROLE_ID):
-        role = _guild.get_role(rid)
-        try:
-            if role and role in member.roles:
-                await member.remove_roles(role, reason="LiveChat reset")
-        except Exception:
-            pass
-
+# --- Votes 👍/👎 (compteurs live, plus de points ni de rôles) ---
 async def handle_vote(websocket, data):
     alert_id = data.get("alert_id")
-    author_id = alert_authors.get(alert_id)
-    if not author_id:
+    if alert_id not in alert_authors:
         return  # alerte inconnue / expirée
+    author_id = alert_authors.get(alert_id)
     raw = data.get("value", 0)
     value = 1 if raw > 0 else (-1 if raw < 0 else 0)
     entry = manager.active_connections.get(websocket, {})
@@ -330,33 +259,15 @@ async def handle_vote(websocket, data):
     prev = votes.get(voter_key, 0)
     if value == prev:
         return
-    votes[voter_key] = value
-    pts = load_points()
-    pts[author_id] = int(pts.get(author_id, 0)) + (value - prev)
-    save_points(pts)
-    await apply_rank_role(author_id, pts[author_id])
-    await manager.broadcast_leaderboard()
-
-async def reset_ranks():
-    pts = load_points()
-    save_points({})
-    alert_votes.clear()
-    for did in list(pts.keys()):
-        await clear_rank_roles(did)
-    await manager.broadcast_leaderboard()
+    if value == 0:
+        votes.pop(voter_key, None)
+    else:
+        votes[voter_key] = value
+    await manager.broadcast_vote_counts(alert_id)
 
 @bot.event
 async def on_ready():
-    global _guild
-    ch = bot.get_channel(MEDIA_CHANNEL_ID)
-    _guild = ch.guild if ch else (bot.guilds[0] if bot.guilds else None)
-    if _guild:
-        drole = _guild.get_role(DROLE_ROLE_ID)
-        pasdrole = _guild.get_role(PASDROLE_ROLE_ID)
-        print(f"✅ Bot prêt ({bot.user}). Guilde: {_guild.name}")
-        print(f"   Rôles -> drôle: {drole}, pas drôle: {pasdrole} | manage_roles: {_guild.me.guild_permissions.manage_roles}")
-    else:
-        print("⚠️ Aucune guilde trouvée pour la gestion des rôles")
+    print(f"✅ Bot prêt ({bot.user}).")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -366,7 +277,6 @@ async def websocket_endpoint(websocket: WebSocket):
         names = sorted(load_discord_links().keys(), key=str.lower)
         await websocket.send_json({"type": "roster", "names": names})
         await websocket.send_json(manager.channels_payload(websocket))
-        await websocket.send_json({"type": "leaderboard", "entries": await manager.build_leaderboard()})
     except Exception:
         pass
     await manager.broadcast_presence()  # Informe tout le monde de la nouvelle connexion
@@ -436,10 +346,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     await manager.broadcast_presence()
             elif mtype == "vote":
                 await handle_vote(websocket, data)
-            elif mtype == "admin_reset_ranks":
-                entry = manager.active_connections.get(websocket, {})
-                if manager.is_admin(entry):
-                    await reset_ranks()
     except (WebSocketDisconnect, RuntimeError):
         # Déconnexion normale ou socket déjà fermée (vieux clients qui churnent) : on ignore
         pass
@@ -573,14 +479,6 @@ async def pop(ctx, *, texte: str = ""):
         "user_avatar": user_avatar
     })
     await ctx.send(f"✅ → salon **{target}**")
-
-@bot.command()
-async def resetranks(ctx):
-    if str(ctx.author.id) not in ADMIN_IDS:
-        await ctx.send("⛔ Réservé à l'admin.", delete_after=5)
-        return
-    await reset_ranks()
-    await ctx.send("✅ Rangs réinitialisés (points à 0, rôles retirés).")
 
 @app.get("/version")
 async def get_version():

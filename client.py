@@ -17,6 +17,7 @@ import webbrowser
 import urllib.parse
 import winreg
 import subprocess
+import ctypes
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget, QGraphicsDropShadowEffect, QPushButton
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QObject, QTimer, QSize
@@ -38,7 +39,7 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 21  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 23  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
@@ -128,8 +129,8 @@ class Communicate(QObject):
     identity = pyqtSignal(dict)
     # Liste des salons + statut admin ({list, is_admin, subscribed})
     channels = pyqtSignal(dict)
-    # Classement (rangs) : liste [{name, avatar, points, drole}, ...]
-    leaderboard = pyqtSignal(list)
+    # Compteurs de votes live d'un pop : (alert_id, up, down)
+    vote_counts = pyqtSignal(str, int, int)
 
 class Overlay(QWidget):
     def __init__(self):
@@ -201,15 +202,17 @@ class Overlay(QWidget):
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(10)
 
-        # --- VOTES 👍 / 👎 (agissent sur les points de l'auteur du pop) ---
+        # --- VOTES 👍 / 👎 (compteurs live du pop, affichés sur le bouton) ---
         self.current_alert_id = ""
         self.my_vote = 0
-        self.vote_up_btn = QPushButton("👍")
-        self.vote_up_btn.setFixedSize(38, 38)
+        self.up_count = 0
+        self.down_count = 0
+        self.vote_up_btn = QPushButton()
+        self.vote_up_btn.setFixedSize(64, 38)
         self.vote_up_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.vote_up_btn.clicked.connect(lambda: self._vote(1))
-        self.vote_down_btn = QPushButton("👎")
-        self.vote_down_btn.setFixedSize(38, 38)
+        self.vote_down_btn = QPushButton()
+        self.vote_down_btn.setFixedSize(64, 38)
         self.vote_down_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.vote_down_btn.clicked.connect(lambda: self._vote(-1))
         controls_layout.addWidget(self.vote_up_btn)
@@ -321,12 +324,20 @@ class Overlay(QWidget):
         for d in (120, 400, 900, 1600):
             QTimer.singleShot(d, self._raise_overlays)
 
+    def _force_topmost(self, w):
+        # Force la fenêtre au 1er plan absolu SANS lui donner le focus (garde les commandes du jeu)
+        # SetWindowPos(hwnd, HWND_TOPMOST=-1, 0,0,0,0, SWP_NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW)
+        try:
+            hwnd = int(w.winId())
+            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0040)
+        except Exception:
+            pass
+
     def _raise_overlays(self):
-        # Remonte le texte + les contrôles au-dessus de la vidéo
-        if self.text_window.isVisible():
-            self.text_window.raise_()
-        if self.controls_window.isVisible():
-            self.controls_window.raise_()
+        # Passe l'overlay + le texte + les contrôles au 1er plan (dans l'ordre : vidéo < texte < contrôles)
+        for w in (self, self.text_window, self.controls_window):
+            if w.isVisible():
+                self._force_topmost(w)
 
     def play_alert(self, url, text, user, user_avatar="", alert_id=""):
         if not self.isEnabled():
@@ -366,6 +377,8 @@ class Overlay(QWidget):
         # Nouvelle alerte -> on réinitialise l'état de vote
         self.current_alert_id = alert_id
         self.my_vote = 0
+        self.up_count = 0
+        self.down_count = 0
         self._update_vote_buttons()
         self.label.setText(text.upper())
         self.user_label.setText(user.upper())
@@ -466,13 +479,23 @@ class Overlay(QWidget):
                 os.remove(path)
         except: pass
 
-    _VOTE_IDLE = "background-color: rgba(40,40,60,210); color: white; border-radius: 19px; border: 2px solid white; font-size: 16px;"
-    _VOTE_UP_ON = "background-color: rgba(64,200,110,235); color: white; border-radius: 19px; border: 2px solid white; font-size: 16px;"
-    _VOTE_DOWN_ON = "background-color: rgba(235,80,110,235); color: white; border-radius: 19px; border: 2px solid white; font-size: 16px;"
+    _VOTE_IDLE = "background-color: rgba(40,40,60,210); color: white; border-radius: 19px; border: 2px solid white; font-size: 15px; font-weight: bold;"
+    _VOTE_UP_ON = "background-color: rgba(64,200,110,235); color: white; border-radius: 19px; border: 2px solid white; font-size: 15px; font-weight: bold;"
+    _VOTE_DOWN_ON = "background-color: rgba(235,80,110,235); color: white; border-radius: 19px; border: 2px solid white; font-size: 15px; font-weight: bold;"
 
     def _update_vote_buttons(self):
+        self.vote_up_btn.setText(f"👍 {self.up_count}")
+        self.vote_down_btn.setText(f"👎 {self.down_count}")
         self.vote_up_btn.setStyleSheet(self._VOTE_UP_ON if self.my_vote == 1 else self._VOTE_IDLE)
         self.vote_down_btn.setStyleSheet(self._VOTE_DOWN_ON if self.my_vote == -1 else self._VOTE_IDLE)
+
+    def on_vote_counts(self, alert_id, up, down):
+        # Compteurs live reçus du serveur : ne mettre à jour que le pop en cours
+        if alert_id != self.current_alert_id:
+            return
+        self.up_count = up
+        self.down_count = down
+        self._update_vote_buttons()
 
     def _vote(self, value):
         if not self.current_alert_id:
@@ -614,12 +637,8 @@ def send_admin_channel(action, name):
     _ws_send({"type": "admin_channel", "action": action, "name": name})
 
 def send_vote(alert_id, value):
-    # Vote sur un pop (agit sur les points de l'auteur)
+    # Vote sur un pop (👍 / 👎, comptés en live)
     _ws_send({"type": "vote", "alert_id": alert_id, "value": value})
-
-def send_reset_ranks():
-    # Admin only : réinitialise tous les rangs
-    _ws_send({"type": "admin_reset_ranks"})
 
 def send_oauth(code, code_verifier):
     if not _ws_send({"type": "oauth", "code": code, "code_verifier": code_verifier, "redirect_uri": OAUTH_REDIRECT_URI}):
@@ -712,8 +731,8 @@ async def websocket_listener():
                         comm.identity.emit(data)
                     elif mtype == "channels":
                         comm.channels.emit(data)
-                    elif mtype == "leaderboard":
-                        comm.leaderboard.emit(data.get("entries", []))
+                    elif mtype == "vote_counts":
+                        comm.vote_counts.emit(data.get("alert_id", ""), int(data.get("up", 0)), int(data.get("down", 0)))
                     elif "url" in data:  # alerte média (type "alert" ou ancien format)
                         comm.signal.emit(data['url'], data.get('text', ''), data.get('user', 'ANONYME'), data.get('user_avatar', ''), data.get('alert_id', ''))
         except Exception as e:
@@ -1036,35 +1055,6 @@ class ControlWindow(QWidget):
         """)
         layout.addWidget(self.users_list)
 
-        # --- CLASSEMENT (rangs drôle 😂 / pas drôle 💀) — visible par tout le monde ---
-        self.label_rank = QLabel("Classement :")
-        self.label_rank.setStyleSheet("color: #89b4fa; font-weight: bold;")
-        layout.addWidget(self.label_rank)
-
-        self.rank_list = QListWidget()
-        self.rank_list.setFixedHeight(95)
-        self.rank_list.setIconSize(QSize(24, 24))
-        self.rank_list.setStyleSheet("""
-            QListWidget {
-                background-color: #181825;
-                color: white;
-                border: 1px solid #313244;
-                border-radius: 8px;
-                font-size: 13px;
-                padding: 4px;
-            }
-            QListWidget::item { padding: 3px 4px; }
-        """)
-        layout.addWidget(self.rank_list)
-
-        # Bouton admin : réinitialiser les rangs (visible seulement pour EWEN)
-        self.reset_ranks_btn = QPushButton("Réinitialiser les rangs")
-        self.reset_ranks_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.reset_ranks_btn.setStyleSheet("QPushButton { background:#fab387; color:#11111b; font-weight:bold; border-radius:6px; padding:5px; } QPushButton:hover { background:#f9c99a; }")
-        self.reset_ranks_btn.clicked.connect(self._admin_reset_ranks)
-        layout.addWidget(self.reset_ranks_btn)
-        self.reset_ranks_btn.hide()
-
         self.quit_btn.clicked.connect(app.quit)
         layout.addWidget(self.quit_btn)
 
@@ -1076,10 +1066,8 @@ class ControlWindow(QWidget):
         if self.pseudo_row.isVisible():
             h += 40
         h += 110  # section salons (label + liste scrollable)
-        h += 130  # section classement (label + liste)
         if getattr(self, "is_admin", False):
             h += 40  # ligne "créer un salon" (admin)
-            h += 40  # bouton "réinitialiser les rangs" (admin)
         self.setFixedSize(270, h)
         self.container.setGeometry(5, 5, 260, h - 10)
 
@@ -1219,29 +1207,7 @@ class ControlWindow(QWidget):
             self.channels_layout.addWidget(row)
 
         self.admin_row.setVisible(self.is_admin)
-        self.reset_ranks_btn.setVisible(self.is_admin)  # bouton reset rangs = admin only
         self._refresh_height()
-
-    def on_leaderboard(self, entries):
-        # Met à jour le classement (drôle 😂 / pas drôle 💀)
-        self.rank_list.clear()
-        for i, e in enumerate(entries, 1):
-            emoji = "😂" if e.get("drole") else "💀"
-            pts = int(e.get("points", 0))
-            item = QListWidgetItem(f"{i}. {emoji}  {e.get('name', '?')}  ({pts:+d})")
-            icon = self._avatar_icon(e.get("avatar"))
-            if icon is not None:
-                item.setIcon(icon)
-            self.rank_list.addItem(item)
-
-    def _admin_reset_ranks(self):
-        r = QMessageBox.question(
-            self, "Réinitialiser les rangs",
-            "Remettre TOUS les points à 0 et retirer les rôles drôle/pas drôle ?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if r == QMessageBox.StandardButton.Yes:
-            send_reset_ranks()
 
     def _channels_changed(self):
         global CURRENT_CHANNELS
@@ -1352,7 +1318,7 @@ if __name__ == "__main__":
     comm.roster.connect(control_win.set_roster)
     comm.identity.connect(control_win.on_identity)
     comm.channels.connect(control_win.on_channels)
-    comm.leaderboard.connect(control_win.on_leaderboard)
+    comm.vote_counts.connect(overlay.on_vote_counts)
 
     tray_icon = QSystemTrayIcon(app)
     

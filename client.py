@@ -42,7 +42,7 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 32  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 33  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
@@ -164,6 +164,8 @@ class Communicate(QObject):
     vote_event = pyqtSignal(str, int, str)
     # Avatar téléchargé prêt à animer (revient du thread de fond) : (avatar_url, value, alert_id)
     pp_ready = pyqtSignal(str, int, str)
+    # Une mise à jour est disponible (n° de version) -> affiche le bouton "Mettre à jour"
+    update_available = pyqtSignal(int)
 
 class Overlay(QWidget):
     def __init__(self):
@@ -752,58 +754,69 @@ def _cleanup_old_update():
     except Exception:
         pass
 
-def check_update():
-    # Vérifie s'il existe une version plus récente et se remplace + redémarre (exe uniquement)
-    if not getattr(sys, "frozen", False):
-        return  # pas d'auto-update en dev (.py)
+def _get_latest_version():
+    # Renvoie le n° de la dernière version dispo côté serveur, ou None si indispo.
     try:
         r = requests.get(UPDATE_BASE + "/version", timeout=8, verify=certifi.where())
-        latest = int(r.json().get("version", 0))
+        return int(r.json().get("version", 0))
     except Exception:
-        return
-    if latest <= APP_VERSION:
-        return
-    print(f"⬆️ Mise à jour dispo : v{latest} (actuelle v{APP_VERSION}), téléchargement...")
+        return None
+
+def apply_update():
+    # Télécharge la dernière version et relance PROPREMENT via un petit script .bat :
+    # le script attend que CE process soit fermé, remplace l'exe, puis relance la nouvelle version.
+    # -> plus de course de fichiers/_MEI entre l'ancienne et la nouvelle instance = plus d'erreur Python.
+    if not getattr(sys, "frozen", False):
+        return  # pas d'update en dev (.py)
     try:
         data = requests.get(UPDATE_BASE + "/download", timeout=300, verify=certifi.where()).content
     except Exception as e:
-        print("Téléchargement MAJ échoué:", e)
+        log(f"Téléchargement MAJ échoué: {e}")
         return
     if len(data) < 5_000_000 or data[:2] != b"MZ":
-        print("MAJ ignorée : fichier invalide")
+        log("MAJ ignorée : fichier invalide")
         return
     cur = sys.executable
     new_tmp = cur + ".new"
-    old = cur + ".old"
+    bat = cur + ".update.bat"
     try:
         with open(new_tmp, "wb") as f:
             f.write(data)
-        if os.path.exists(old):
-            try:
-                os.remove(old)
-            except Exception:
-                pass
-        os.rename(cur, old)       # renommer l'exe en cours est autorisé sous Windows
-        os.rename(new_tmp, cur)   # la nouvelle version reprend le nom d'origine
-        print("✅ Mise à jour installée, redémarrage...")
-        # Relance DIFFÉRÉE (~2s) et détachée : on laisse d'abord CE process se fermer et nettoyer
-        # son dossier temporaire _MEI (PyInstaller onefile) AVANT que la nouvelle instance — et
-        # l'antivirus qui la scanne — ne démarre. Réduit fortement le warning
-        # "Failed to remove temporary directory".
-        try:
-            CREATE_NO_WINDOW = 0x08000000
-            subprocess.Popen(f'ping 127.0.0.1 -n 3 >nul & start "" "{cur}"',
-                             shell=True, creationflags=CREATE_NO_WINDOW, close_fds=True)
-        except Exception:
-            subprocess.Popen([cur])  # fallback : relance immédiate
+        # Le script : attend ~3s que CE process se ferme, remplace l'exe (move /Y = écrase),
+        # réessaie une fois si encore verrouillé, relance, puis se supprime lui-même. Pas de boucle infinie.
+        with open(bat, "w", encoding="ascii") as f:
+            f.write(
+                "@echo off\r\n"
+                "ping 127.0.0.1 -n 4 >nul\r\n"
+                f'move /Y "{new_tmp}" "{cur}" >nul 2>&1\r\n'
+                f'if exist "{new_tmp}" ( ping 127.0.0.1 -n 3 >nul & move /Y "{new_tmp}" "{cur}" >nul 2>&1 )\r\n'
+                f'start "" "{cur}"\r\n'
+                'del "%~f0" >nul 2>&1\r\n'
+            )
+        log("✅ MAJ téléchargée, relance via script...")
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000, close_fds=True)
         os._exit(0)
     except Exception as e:
-        print("MAJ échouée:", e)
-        try:  # rollback si besoin
-            if not os.path.exists(cur) and os.path.exists(old):
-                os.rename(old, cur)
-        except Exception:
-            pass
+        log(f"MAJ échouée: {e}")
+
+def check_update_startup():
+    # Au lancement : s'il existe une version plus récente, on prévient l'UI (bouton), sans relance surprise.
+    if not getattr(sys, "frozen", False):
+        return
+    latest = _get_latest_version()
+    if latest and latest > APP_VERSION:
+        log(f"⬆️ MAJ dispo au lancement : v{latest} (actuelle v{APP_VERSION})")
+        comm.update_available.emit(latest)
+
+def update_watcher():
+    # Pendant que l'app tourne : vérifie toutes les 5 min -> signale un bouton si une MAJ sort.
+    if not getattr(sys, "frozen", False):
+        return
+    while True:
+        time.sleep(300)
+        latest = _get_latest_version()
+        if latest and latest > APP_VERSION:
+            comm.update_available.emit(latest)
 
 def make_ssl_context():
     # On force l'utilisation du magasin de certificats fourni par 'certifi' (toujours à jour)
@@ -1003,6 +1016,14 @@ class ControlWindow(QWidget):
         layout = QVBoxLayout(self.container)
         layout.setSpacing(10) # Ajoute 10 pixels d'espace entre chaque widget
         layout.setContentsMargins(15, 15, 15, 15) # Marges intérieures plus confortables
+
+        # --- BOUTON MISE À JOUR (caché ; apparaît quand une nouvelle version est dispo) ---
+        self.update_btn = QPushButton("⬆️ Mettre à jour")
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setStyleSheet("QPushButton { background:#a6e3a1; color:#11111b; font-weight:bold; border-radius:8px; padding:8px; } QPushButton:hover { background:#c0f0bb; }")
+        self.update_btn.clicked.connect(self._do_update)
+        self.update_btn.hide()
+        layout.addWidget(self.update_btn)
 
         # --- LIGNE IDENTITÉ : "Je suis" (fallback, caché si connecté via Discord) ---
         self.pseudo_row = QWidget()
@@ -1307,8 +1328,28 @@ class ControlWindow(QWidget):
         h += 110  # section salons (label + liste scrollable)
         if getattr(self, "is_admin", False):
             h += 40  # ligne "créer un salon" (admin)
+        if getattr(self, "update_btn", None) is not None and self.update_btn.isVisible():
+            h += 48  # bouton "Mettre à jour"
         self.setFixedSize(270, h)
         self.container.setGeometry(5, 5, 260, h - 10)
+
+    def on_update_available(self, latest):
+        # Une MAJ est dispo : on affiche le bouton + une notif systray
+        self.update_btn.setText(f"⬆️ Mettre à jour (v{latest})")
+        self.update_btn.show()
+        self._refresh_height()
+        try:
+            tray_icon.showMessage("LiveChat",
+                                  f"Mise à jour v{latest} dispo — clique sur l'icône puis « Mettre à jour ».",
+                                  QSystemTrayIcon.MessageIcon.Information, 8000)
+        except Exception:
+            pass
+
+    def _do_update(self):
+        # Lance la mise à jour (télécharge + relance via script). apply_update() termine par os._exit.
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("Mise à jour en cours…")
+        threading.Thread(target=apply_update, daemon=True).start()
 
     def toggle_bot(self, state):
         is_active = (state == 2) # 2 = Checked
@@ -1546,6 +1587,14 @@ class ControlWindow(QWidget):
         super().changeEvent(event)
 
 if __name__ == "__main__":
+    # Journalise toute erreur non gérée -> pour diagnostiquer une "erreur Python" au lancement
+    def _log_excepthook(exc_type, exc, tb):
+        import traceback
+        log("💥 ERREUR NON GÉRÉE:\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = _log_excepthook
+    log(f"===== LiveChat v{APP_VERSION} démarre (pid {os.getpid()}) =====")
+
     _cleanup_old_update()  # supprime l'ancien exe laissé par une MAJ précédente
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -1560,6 +1609,7 @@ if __name__ == "__main__":
     comm.vote_counts.connect(overlay.on_vote_counts)
     comm.vote_event.connect(overlay.on_vote_event)
     comm.pp_ready.connect(overlay._on_pp_ready)
+    comm.update_available.connect(control_win.on_update_available)
 
     tray_icon = QSystemTrayIcon(app)
     
@@ -1605,6 +1655,7 @@ if __name__ == "__main__":
 
     tray_icon.show()
 
-    threading.Thread(target=check_update, daemon=True).start()  # auto-update en arrière-plan
+    threading.Thread(target=check_update_startup, daemon=True).start()  # MAJ dispo au lancement -> bouton
+    threading.Thread(target=update_watcher, daemon=True).start()        # vérifie en continu -> bouton
     threading.Thread(target=lambda: asyncio.run(websocket_listener()), daemon=True).start()
     sys.exit(app.exec())

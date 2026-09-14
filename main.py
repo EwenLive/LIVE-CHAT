@@ -31,6 +31,25 @@ ADMIN_IDS = set(x.strip() for x in os.getenv("ADMIN_IDS", "355828855765729285").
 # Jetons admin (émis après une connexion OAuth VÉRIFIÉE d'un admin). En mémoire → effacés au redémarrage.
 ADMIN_TOKENS = {}  # token -> discord_id
 
+# Contrôle d'accès à !pop : nom du rôle Discord qui autorise à envoyer des pops.
+# Tant que ce rôle n'existe PAS sur le serveur, tout le monde peut pop (comportement par défaut).
+# Dès qu'il existe, seuls ceux qui l'ont (+ les admins) peuvent pop.
+POP_ROLE_NAME = os.getenv("POP_ROLE_NAME", "livechat").strip().lower()
+# Durée de vie du cache d'avatars (sec) : au-delà on re-vérifie la pp Discord (elles changent)
+AVATAR_TTL = int(os.getenv("AVATAR_TTL", "1800"))  # 30 min
+
+def can_pop(member) -> bool:
+    if str(getattr(member, "id", "")) in ADMIN_IDS:
+        return True  # admins toujours autorisés
+    guild = getattr(member, "guild", None)
+    roles = getattr(member, "roles", None)
+    if guild is None or roles is None:
+        return True  # contexte sans rôles (ex: DM) → on n'bloque pas
+    gate = next((r for r in guild.roles if r.name.strip().lower() == POP_ROLE_NAME), None)
+    if gate is None:
+        return True  # rôle non créé → accès ouvert à tous
+    return gate in roles
+
 def load_channels() -> list:
     try:
         with open(CHANNELS_PATH, "r", encoding="utf-8") as f:
@@ -129,11 +148,11 @@ class ConnectionManager:
         # Une identité par connexion : {websocket: {"name": str, "discord_id": str|None}}
         self.active_connections: dict[WebSocket, dict] = {}
         # Cache des identités Discord résolues : ID -> {"name":.., "avatar":..} (succès uniquement)
-        self._avatar_cache: dict[str, dict] = {}
+        self._avatar_cache: dict[str, tuple] = {}  # discord_id -> (timestamp, {name, avatar})
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[websocket] = {"name": "Anonyme", "discord_id": None, "channels": {"general"}, "verified": False}
+        self.active_connections[websocket] = {"name": "Anonyme", "discord_id": None, "channels": {"general"}, "verified": False, "client_id": None}
 
     def disconnect(self, websocket: WebSocket):
         self.active_connections.pop(websocket, None)
@@ -163,18 +182,21 @@ class ConnectionManager:
             discord_id = next((v for k, v in links.items() if k.strip().lower() == key), None)
         if not discord_id:
             return {"name": raw_name, "avatar": None}
-        if discord_id in self._avatar_cache:
-            return self._avatar_cache[discord_id]
+        # Cache avec TTL : on re-vérifie l'avatar toutes les AVATAR_TTL sec (les pp Discord changent)
+        cached = self._avatar_cache.get(discord_id)
+        if cached and (time.time() - cached[0]) < AVATAR_TTL:
+            return cached[1]
         try:
             user = await bot.fetch_user(int(discord_id))
             info = {
                 "name": user.global_name or user.name,
                 "avatar": str(user.display_avatar.replace(size=64, static_format="png").url),
             }
-            self._avatar_cache[discord_id] = info  # On ne met en cache que les succès
+            self._avatar_cache[discord_id] = (time.time(), info)  # (timestamp, info)
             return info
         except Exception:
-            return {"name": raw_name, "avatar": None}
+            # Échec du refetch : on renvoie l'ancienne valeur si on l'a, sinon le nom brut
+            return cached[1] if cached else {"name": raw_name, "avatar": None}
 
     async def get_users(self) -> list[dict]:
         # Snapshot : on copie avant d'itérer car _resolve fait un await (fetch_user)
@@ -248,13 +270,13 @@ async def handle_vote(websocket, data):
     alert_id = data.get("alert_id")
     if alert_id not in alert_authors:
         return  # alerte inconnue / expirée
-    author_id = alert_authors.get(alert_id)
     raw = data.get("value", 0)
     value = 1 if raw > 0 else (-1 if raw < 0 else 0)
     entry = manager.active_connections.get(websocket, {})
-    voter_key = entry.get("discord_id") or f"ws:{id(websocket)}"
-    if voter_key == author_id:
-        return  # pas de vote sur son propre pop
+    # Identité de vote STABLE : discord_id (OAuth) sinon client_id persistant sinon la socket.
+    # Évite qu'une reconnexion (nouvelle socket) recompte le même votant en double.
+    voter_key = entry.get("discord_id") or entry.get("client_id") or f"ws:{id(websocket)}"
+    # NB : voter sur son PROPRE pop est autorisé (comportement global, self-like compte pour tous).
     votes = alert_votes.setdefault(alert_id, {})
     prev = votes.get(voter_key, 0)
     if value == prev:
@@ -264,6 +286,11 @@ async def handle_vote(websocket, data):
     else:
         votes[voter_key] = value
     await manager.broadcast_vote_counts(alert_id)
+    # Événement de vote (pour l'anim pp côté client) : on envoie l'avatar du votant. Pas d'anim sur une annulation.
+    if value != 0:
+        info = await manager._resolve(entry)
+        await manager.broadcast({"type": "vote_event", "alert_id": alert_id, "value": value,
+                                 "avatar": info.get("avatar"), "name": info.get("name")})
 
 @bot.event
 async def on_ready():
@@ -301,9 +328,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     discord_id = ADMIN_TOKENS[token]
                     verified = True
                 manager.set_identity(websocket, name=name, discord_id=discord_id, verified=verified)
+                # Identité de vote stable : on mémorise le client_id persistant du client
+                cid = data.get("client_id")
+                entry = manager.active_connections.get(websocket)
+                if entry is not None and cid:
+                    entry["client_id"] = str(cid)
                 await manager.broadcast_presence()
                 try:
                     await websocket.send_json(manager.channels_payload(websocket))  # is_admin à jour
+                    # Resynchro : si le client affiche un pop, on lui renvoie son compteur de votes à jour
+                    a_id = data.get("alert_id")
+                    if a_id and a_id in alert_authors:
+                        votes = alert_votes.get(a_id, {})
+                        up = sum(1 for v in votes.values() if v > 0)
+                        down = sum(1 for v in votes.values() if v < 0)
+                        await websocket.send_json({"type": "vote_counts", "alert_id": a_id, "up": up, "down": down})
                 except Exception:
                     pass
             elif mtype == "subscribe":
@@ -410,6 +449,11 @@ async def pop(ctx, *, texte: str = ""):
         await ctx.send(f"⚠️ Les `!pop` se font uniquement dans <#{MEDIA_CHANNEL_ID}>.", delete_after=6)
         return
 
+    # Contrôle d'accès : seuls les membres avec le rôle « livechat » (+ admins) peuvent envoyer des pops
+    if not can_pop(ctx.author):
+        await ctx.send(f"⛔ Tu n'as pas accès à LiveChat. Demande le rôle **{POP_ROLE_NAME}** à un admin.", delete_after=6)
+        return
+
     # Salon cible : si le 1er mot est un salon existant, c'est la cible (sinon "general")
     channels = load_channels()
     target = "general"
@@ -479,6 +523,21 @@ async def pop(ctx, *, texte: str = ""):
         "user_avatar": user_avatar
     })
     await ctx.send(f"✅ → salon **{target}**")
+
+@bot.command()
+async def status(ctx):
+    # Vérif rapide "est-ce que LiveChat est en ligne ?" — utilisable par tout le monde dans Discord.
+    # Si le bot NE répond PAS à cette commande => le serveur/bot est tombé.
+    conns = list(manager.active_connections.values())
+    names = ", ".join(sorted((e.get("name") or "?") for e in conns)) or "personne"
+    gate = None
+    if ctx.guild:
+        gate = next((r for r in ctx.guild.roles if r.name.strip().lower() == POP_ROLE_NAME), None)
+    acces = f"restreint au rôle **{POP_ROLE_NAME}**" if gate else "ouvert à tous"
+    await ctx.send(
+        f"🟢 LiveChat en ligne — **{len(conns)}** client(s) connecté(s) : {names}\n"
+        f"🔐 Accès !pop : {acces}"
+    )
 
 @app.get("/version")
 async def get_version():

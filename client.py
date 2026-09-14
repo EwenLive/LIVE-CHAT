@@ -4,6 +4,8 @@ import asyncio
 import threading
 import websockets
 import os
+import time
+import random
 import ssl
 import certifi
 import getpass
@@ -19,9 +21,10 @@ import winreg
 import subprocess
 import ctypes
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget, QGraphicsDropShadowEffect, QPushButton
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QObject, QTimer, QSize
-from PyQt6.QtGui import QColor, QPixmap, QImage, QMovie, QPainter, QPainterPath
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget, QGraphicsDropShadowEffect, QPushButton, QGraphicsOpacityEffect
+from PyQt6.QtCore import (Qt, QUrl, pyqtSignal, QObject, QTimer, QSize, QVariantAnimation, QEasingCurve,
+                          QPropertyAnimation, QParallelAnimationGroup, QPoint)
+from PyQt6.QtGui import QColor, QPixmap, QImage, QMovie, QPainter, QPainterPath, QPen
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
@@ -39,12 +42,29 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 23  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 31  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
 # Stocke le pseudo dans %APPDATA%\LiveChat\config.json (persiste entre les sessions)
 CONFIG_PATH = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "LiveChat", "config.json")
+LOG_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "livechat.log")
+
+def log(msg):
+    # Journalise dans %APPDATA%/LiveChat/livechat.log (pour diagnostiquer les coupures) + console
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    try:
+        print(line)
+    except Exception:
+        pass
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 500_000:  # rotation simple
+            open(LOG_PATH, "w").close()
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 def load_config():
     try:
@@ -75,6 +95,15 @@ CURRENT_DISCORD_ID = _cfg.get("discord_id")
 CURRENT_ADMIN_TOKEN = _cfg.get("admin_token")
 # Salons auxquels on est abonné (persisté)
 CURRENT_CHANNELS = _cfg.get("channels") or ["general"]
+# Identité de vote STABLE (persistée) : indépendante des reconnexions -> dédup fiable des votes
+CURRENT_CLIENT_ID = _cfg.get("client_id")
+if not CURRENT_CLIENT_ID:
+    CURRENT_CLIENT_ID = uuid.uuid4().hex
+    update_config(client_id=CURRENT_CLIENT_ID)
+# alert_id du pop actuellement affiché + mon vote courant (partagés GUI -> thread WS pour la
+# resynchro à la reconnexion : on re-joue mon vote si la coupure l'a fait perdre)
+CURRENT_ALERT_ID = ""
+CURRENT_MY_VOTE = 0
 
 # --- OAuth2 Discord ---
 DISCORD_CLIENT_ID = "1464725799205601320"   # = ID de l'application (le secret reste sur le serveur)
@@ -131,6 +160,10 @@ class Communicate(QObject):
     channels = pyqtSignal(dict)
     # Compteurs de votes live d'un pop : (alert_id, up, down)
     vote_counts = pyqtSignal(str, int, int)
+    # Événement de vote (pour l'anim pp) : (alert_id, value, avatar_url)
+    vote_event = pyqtSignal(str, int, str)
+    # Avatar téléchargé prêt à animer (revient du thread de fond) : (avatar_url, value, alert_id)
+    pp_ready = pyqtSignal(str, int, str)
 
 class Overlay(QWidget):
     def __init__(self):
@@ -228,6 +261,18 @@ class Overlay(QWidget):
         self.controls_window.adjustSize()
         self.controls_window.hide()
 
+        # --- FENÊTRE D'ANIMATION DES VOTES (pp qui montent façon TikTok) : click-through, au-dessus de la vidéo ---
+        self.anim_window = QWidget()
+        self.anim_window.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.anim_window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.anim_window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.anim_window.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)  # ne capture pas la souris
+        self.anim_window.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
+        self.anim_window.resize(170, 380)
+        self.anim_window.hide()
+        self._pp_anims = []        # anims en cours (garde une réf sinon GC)
+        self._pp_img_cache = {}    # url -> QImage (téléchargée en fond, thread-safe)
+
         self.shadow = QGraphicsDropShadowEffect()
         self.shadow.setBlurRadius(1)
         self.shadow.setXOffset(4)
@@ -294,6 +339,7 @@ class Overlay(QWidget):
             print(f"🖥️ Écran de sortie : {screen.name()} ({geo.width()}x{geo.height()})")
 
     def show_all(self):
+        self._set_overlay_opacity(1.0)  # au cas où un fondu précédent a été interrompu
         screen = self.target_screen or QApplication.primaryScreen()
         pos_x = pos_y = 0
         if screen:
@@ -318,6 +364,13 @@ class Overlay(QWidget):
         self.controls_window.show()
         self.controls_window.raise_()
 
+        # Zone d'anim des votes : juste AU-DESSUS des boutons (les pp montent depuis les boutons)
+        ax = cx + self.controls_window.width() - self.anim_window.width()
+        ay = cy - self.anim_window.height()
+        self.anim_window.move(ax, ay)
+        self.anim_window.show()
+        self.anim_window.raise_()
+
         # La surface vidéo native peut passer AU-DESSUS du texte -> on ré-affirme l'ordre
         # plusieurs fois (corrige le "vidéo affichée mais pas l'interface/texte/votes")
         self._raise_overlays()
@@ -334,8 +387,8 @@ class Overlay(QWidget):
             pass
 
     def _raise_overlays(self):
-        # Passe l'overlay + le texte + les contrôles au 1er plan (dans l'ordre : vidéo < texte < contrôles)
-        for w in (self, self.text_window, self.controls_window):
+        # Passe l'overlay + le texte + les contrôles + l'anim au 1er plan (vidéo < texte < contrôles/anim)
+        for w in (self, self.text_window, self.controls_window, self.anim_window):
             if w.isVisible():
                 self._force_topmost(w)
 
@@ -368,14 +421,46 @@ class Overlay(QWidget):
         if not self.is_playing:
             return
         self.is_playing = False
-        self.hide_overlay()
-        QTimer.singleShot(350, self._maybe_start_next)
+        if self.isVisible():
+            self._fade_out_and_hide()  # fondu de sortie doux
+        else:
+            self.hide_overlay()
+            QTimer.singleShot(350, self._maybe_start_next)
+
+    def _set_overlay_opacity(self, v):
+        # Applique l'opacité aux 3 fenêtres de l'overlay (vidéo/image, texte, contrôles)
+        for w in (self, self.text_window, self.controls_window):
+            try:
+                w.setWindowOpacity(float(v))
+            except Exception:
+                pass
+
+    def _fade_out_and_hide(self):
+        # Fondu de sortie (opacité 1 -> 0) puis nettoyage réel + passage à la suite
+        anim = QVariantAnimation(self)
+        anim.setStartValue(1.0)
+        anim.setEndValue(0.0)
+        anim.setDuration(550)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.valueChanged.connect(self._set_overlay_opacity)
+
+        def done():
+            self.hide_overlay()
+            self._set_overlay_opacity(1.0)  # réarme l'opacité pour la prochaine alerte
+            QTimer.singleShot(350, self._maybe_start_next)
+
+        anim.finished.connect(done)
+        self._fade_anim = anim  # garde une référence (sinon ramassé par le GC -> pas d'animation)
+        anim.start()
 
     def _play_now(self, url, text, user, user_avatar="", alert_id=""):
         print(f"📩 Alerte de {user} : {url}")
         self.hide_overlay()
         # Nouvelle alerte -> on réinitialise l'état de vote
+        global CURRENT_ALERT_ID, CURRENT_MY_VOTE
         self.current_alert_id = alert_id
+        CURRENT_ALERT_ID = alert_id  # partagé au thread WS pour la resynchro à la reconnexion
+        CURRENT_MY_VOTE = 0
         self.my_vote = 0
         self.up_count = 0
         self.down_count = 0
@@ -471,6 +556,16 @@ class Overlay(QWidget):
         self.video_widget.hide()
         self.text_window.hide()
         self.controls_window.hide()
+        # Stoppe les animations de vote en cours et masque leur fenêtre
+        for grp in list(self._pp_anims):
+            try:
+                grp.stop()
+            except Exception:
+                pass
+        self._pp_anims.clear()
+        for child in self.anim_window.findChildren(QLabel):
+            child.deleteLater()
+        self.anim_window.hide()
         self.hide()
 
     def _delete_file(self, path):
@@ -500,8 +595,12 @@ class Overlay(QWidget):
     def _vote(self, value):
         if not self.current_alert_id:
             return
+        global CURRENT_MY_VOTE
         self.my_vote = 0 if self.my_vote == value else value
+        CURRENT_MY_VOTE = self.my_vote  # partagé au thread WS (re-joué si reconnexion)
         send_vote(self.current_alert_id, self.my_vote)
+        # Les compteurs viennent UNIQUEMENT du serveur (broadcast vote_counts) -> tout le monde
+        # voit le même total. On ne met à jour ici que la surbrillance de mon propre bouton.
         self._update_vote_buttons()
 
     def _show_user_avatar(self, url):
@@ -544,6 +643,96 @@ class Overlay(QWidget):
         painter.drawPixmap((size - src.width()) // 2, (size - src.height()) // 2, src)
         painter.end()
         return out
+
+    # --- ANIMATION DES VOTES (pp qui monte et s'estompe, façon like TikTok) ---
+    def on_vote_event(self, alert_id, value, avatar_url):
+        if alert_id != self.current_alert_id or not self.anim_window.isVisible() or value == 0:
+            return
+        img = self._pp_img_cache.get(avatar_url) if avatar_url else None
+        if img is not None or not avatar_url:
+            self._spawn_vote_pp(img, value)  # déjà en cache, ou aucun avatar -> placeholder direct
+        else:
+            # Télécharge PUIS anime -> la vraie pp s'affiche dès le 1er vote de la personne
+            threading.Thread(target=self._dl_then_spawn, args=(avatar_url, value, alert_id), daemon=True).start()
+
+    def _dl_then_spawn(self, url, value, alert_id):
+        self._dl_pp_img(url)                       # remplit le cache (thread de fond)
+        comm.pp_ready.emit(url, value, alert_id)   # repasse sur le thread GUI pour animer
+
+    def _on_pp_ready(self, url, value, alert_id):
+        if alert_id != self.current_alert_id or not self.anim_window.isVisible():
+            return
+        self._spawn_vote_pp(self._pp_img_cache.get(url), value)
+
+    def _dl_pp_img(self, url):
+        # Thread de fond : télécharge l'avatar en QImage (thread-safe) et le met en cache
+        try:
+            data = requests.get(url, timeout=4).content
+            img = QImage()
+            img.loadFromData(data)
+            if not img.isNull():
+                self._pp_img_cache[url] = img
+        except Exception:
+            pass
+
+    def _round_pp(self, img, size, value):
+        out = QPixmap(size, size)
+        out.fill(Qt.GlobalColor.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addEllipse(2.0, 2.0, float(size - 4), float(size - 4))
+        p.setClipPath(path)
+        if img is not None and not img.isNull():
+            src = QPixmap.fromImage(img).scaled(size - 4, size - 4,
+                                                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                                Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap((size - src.width()) // 2, (size - src.height()) // 2, src)
+        else:
+            p.fillRect(0, 0, size, size, QColor(70, 70, 95))  # placeholder si pas d'avatar
+        p.setClipping(False)
+        pen = QPen(QColor(64, 200, 110) if value > 0 else QColor(235, 80, 110))
+        pen.setWidth(3)
+        p.setPen(pen)
+        p.drawEllipse(2, 2, size - 4, size - 4)
+        p.end()
+        return out
+
+    def _spawn_vote_pp(self, img, value):
+        size = 46
+        lbl = QLabel(self.anim_window)
+        lbl.setPixmap(self._round_pp(img, size, value))
+        lbl.resize(size, size)
+        w = self.anim_window.width()
+        h = self.anim_window.height()
+        x0 = w - size - 12 + random.randint(-8, 8)   # côté droit, près des boutons
+        y0 = h - size - 6
+        lbl.move(x0, y0)
+        lbl.show()
+        lbl.raise_()
+        eff = QGraphicsOpacityEffect(lbl)
+        lbl.setGraphicsEffect(eff)
+        grp = QParallelAnimationGroup(self)
+        move = QPropertyAnimation(lbl, b"pos")
+        move.setDuration(2100)  # plus lent
+        move.setStartValue(QPoint(x0, y0))
+        move.setEndValue(QPoint(x0 + random.randint(-18, 4), y0 - 170))  # monte moins haut
+        move.setEasingCurve(QEasingCurve.Type.OutCubic)
+        fade = QPropertyAnimation(eff, b"opacity")
+        fade.setDuration(2100)
+        fade.setStartValue(1.0)
+        fade.setKeyValueAt(0.3, 1.0)
+        fade.setEndValue(0.0)
+        grp.addAnimation(move)
+        grp.addAnimation(fade)
+
+        def _done():
+            lbl.deleteLater()
+            if grp in self._pp_anims:
+                self._pp_anims.remove(grp)
+        grp.finished.connect(_done)
+        self._pp_anims.append(grp)
+        grp.start()
 
 comm = Communicate()
 
@@ -590,7 +779,16 @@ def check_update():
         os.rename(cur, old)       # renommer l'exe en cours est autorisé sous Windows
         os.rename(new_tmp, cur)   # la nouvelle version reprend le nom d'origine
         print("✅ Mise à jour installée, redémarrage...")
-        subprocess.Popen([cur])
+        # Relance DIFFÉRÉE (~2s) et détachée : on laisse d'abord CE process se fermer et nettoyer
+        # son dossier temporaire _MEI (PyInstaller onefile) AVANT que la nouvelle instance — et
+        # l'antivirus qui la scanne — ne démarre. Réduit fortement le warning
+        # "Failed to remove temporary directory".
+        try:
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(f'ping 127.0.0.1 -n 3 >nul & start "" "{cur}"',
+                             shell=True, creationflags=CREATE_NO_WINDOW, close_fds=True)
+        except Exception:
+            subprocess.Popen([cur])  # fallback : relance immédiate
         os._exit(0)
     except Exception as e:
         print("MAJ échouée:", e)
@@ -626,7 +824,8 @@ def _ws_send(payload):
 
 def send_hello(name):
     # Pousse le pseudo (+ ID Discord + jeton admin mémorisés) vers le serveur
-    _ws_send({"type": "hello", "name": name, "discord_id": CURRENT_DISCORD_ID, "admin_token": CURRENT_ADMIN_TOKEN})
+    _ws_send({"type": "hello", "name": name, "discord_id": CURRENT_DISCORD_ID, "admin_token": CURRENT_ADMIN_TOKEN,
+              "client_id": CURRENT_CLIENT_ID, "alert_id": CURRENT_ALERT_ID})
 
 def send_subscribe(channels):
     # Dit au serveur à quels salons on veut être abonné
@@ -710,15 +909,36 @@ async def websocket_listener():
     ws_loop = asyncio.get_running_loop()
     headers = {"ngrok-skip-browser-warning": "true"}
     ssl_ctx = make_ssl_context()
+    log(f"▶️ Démarrage écoute WebSocket (client v{APP_VERSION})")
     while True:
+        hb = None
         try:
-            async with websockets.connect(SERVER_WS_URL, additional_headers=headers, ssl=ssl_ctx) as ws:
+            # keepalive : ping toutes les 20s, coupe si pas de pong sous 20s (détecte les connexions mortes)
+            async with websockets.connect(SERVER_WS_URL, additional_headers=headers, ssl=ssl_ctx,
+                                          ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
                 ws_current = ws
-                print("✅ Connecté au serveur")
-                # On s'annonce au serveur (pseudo + ID Discord + jeton admin mémorisés si OAuth déjà fait)
-                await ws.send(json.dumps({"type": "hello", "name": CURRENT_USER, "discord_id": CURRENT_DISCORD_ID, "admin_token": CURRENT_ADMIN_TOKEN}))
+                log("✅ Connecté au serveur")
+                # On s'annonce au serveur (pseudo + ID Discord + jeton admin + client_id stable ;
+                # alert_id = pop en cours -> le serveur renvoie son compte à jour = resynchro reconnexion)
+                await ws.send(json.dumps({"type": "hello", "name": CURRENT_USER, "discord_id": CURRENT_DISCORD_ID,
+                                          "admin_token": CURRENT_ADMIN_TOKEN, "client_id": CURRENT_CLIENT_ID,
+                                          "alert_id": CURRENT_ALERT_ID}))
                 # On indique nos salons abonnés
                 await ws.send(json.dumps({"type": "subscribe", "channels": CURRENT_CHANNELS}))
+                # Si j'avais voté sur le pop en cours, je re-joue mon vote (une coupure a pu le perdre)
+                if CURRENT_ALERT_ID and CURRENT_MY_VOTE:
+                    await ws.send(json.dumps({"type": "vote", "alert_id": CURRENT_ALERT_ID, "value": CURRENT_MY_VOTE}))
+
+                async def _heartbeat(sock):
+                    # Heartbeat applicatif : garde la connexion active ET détecte une socket morte
+                    try:
+                        while True:
+                            await asyncio.sleep(25)
+                            await sock.send(json.dumps({"type": "ping"}))
+                    except Exception:
+                        pass  # la boucle de réception gérera la reconnexion
+                hb = asyncio.ensure_future(_heartbeat(ws))
+
                 while True:
                     msg = await ws.recv()
                     data = json.loads(msg)
@@ -733,12 +953,18 @@ async def websocket_listener():
                         comm.channels.emit(data)
                     elif mtype == "vote_counts":
                         comm.vote_counts.emit(data.get("alert_id", ""), int(data.get("up", 0)), int(data.get("down", 0)))
+                    elif mtype == "vote_event":
+                        comm.vote_event.emit(data.get("alert_id", ""), int(data.get("value", 0)), data.get("avatar") or "")
                     elif "url" in data:  # alerte média (type "alert" ou ancien format)
                         comm.signal.emit(data['url'], data.get('text', ''), data.get('user', 'ANONYME'), data.get('user_avatar', ''), data.get('alert_id', ''))
         except Exception as e:
             ws_current = None
             comm.presence.emit([])  # On vide la liste tant qu'on est déconnecté
+            log(f"⚠️ Déconnecté ({type(e).__name__}: {e}) — nouvelle tentative dans 5s")
             await asyncio.sleep(5)
+        finally:
+            if hb is not None:
+                hb.cancel()
 
 class ControlWindow(QWidget):
     def __init__(self, overlay):
@@ -1058,11 +1284,17 @@ class ControlWindow(QWidget):
         self.quit_btn.clicked.connect(app.quit)
         layout.addWidget(self.quit_btn)
 
+        # Version (petit, discret, en bas à droite)
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.version_label.setStyleSheet("color: #6c7086; font-size: 10px; border: none; background: transparent;")
+        layout.addWidget(self.version_label)
+
         self._refresh_height()
 
     def _refresh_height(self):
         # Hauteur dynamique selon les sections visibles
-        h = 495
+        h = 512  # inclut le petit label de version en bas
         if self.pseudo_row.isVisible():
             h += 40
         h += 110  # section salons (label + liste scrollable)
@@ -1319,6 +1551,8 @@ if __name__ == "__main__":
     comm.identity.connect(control_win.on_identity)
     comm.channels.connect(control_win.on_channels)
     comm.vote_counts.connect(overlay.on_vote_counts)
+    comm.vote_event.connect(overlay.on_vote_event)
+    comm.pp_ready.connect(overlay._on_pp_ready)
 
     tray_icon = QSystemTrayIcon(app)
     

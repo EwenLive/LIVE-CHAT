@@ -42,7 +42,7 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 31  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 32  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
@@ -290,6 +290,11 @@ class Overlay(QWidget):
         self.image_timer.setSingleShot(True)
         self.image_timer.timeout.connect(self._on_alert_finished)
 
+        # Ré-affirme le 1er plan EN CONTINU pendant un pop (les jeux plein écran reprennent le dessus)
+        self._topmost_timer = QTimer()
+        self._topmost_timer.setInterval(450)
+        self._topmost_timer.timeout.connect(self._raise_overlays)
+
         self.movie = None
         self.temp_gif_path = None
 
@@ -376,6 +381,7 @@ class Overlay(QWidget):
         self._raise_overlays()
         for d in (120, 400, 900, 1600):
             QTimer.singleShot(d, self._raise_overlays)
+        self._topmost_timer.start()  # + ré-affirme en continu (jeux plein écran)
 
     def _force_topmost(self, w):
         # Force la fenêtre au 1er plan absolu SANS lui donner le focus (garde les commandes du jeu)
@@ -548,6 +554,7 @@ class Overlay(QWidget):
             QTimer.singleShot(500, lambda: self._delete_file(path_to_del))
             
         self.image_timer.stop()
+        self._topmost_timer.stop()  # on arrête de forcer le 1er plan quand le pop est fini
         self.image_label.clear()
         self.user_label.setText("") # Reset le pseudo
         self.user_avatar_label.clear()

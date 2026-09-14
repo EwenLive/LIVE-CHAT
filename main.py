@@ -28,8 +28,26 @@ CHANNELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channe
 DEFAULT_CHANNELS = ["general"]
 # IDs Discord autorisés à créer/supprimer des salons (admins). EWEN par défaut.
 ADMIN_IDS = set(x.strip() for x in os.getenv("ADMIN_IDS", "355828855765729285").split(",") if x.strip())
-# Jetons admin (émis après une connexion OAuth VÉRIFIÉE d'un admin). En mémoire → effacés au redémarrage.
-ADMIN_TOKENS = {}  # token -> discord_id
+# Jetons admin (émis après une connexion OAuth VÉRIFIÉE d'un admin). PERSISTÉS sur disque
+# (volume Docker) -> l'admin survit à un redémarrage/redéploiement du serveur.
+ADMIN_TOKENS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_tokens.json")
+
+def load_admin_tokens() -> dict:
+    try:
+        with open(ADMIN_TOKENS_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return {str(k): str(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def save_admin_tokens():
+    try:
+        with open(ADMIN_TOKENS_PATH, "w", encoding="utf-8") as f:
+            json.dump(ADMIN_TOKENS, f)
+    except Exception:
+        pass
+
+ADMIN_TOKENS = load_admin_tokens()  # token -> discord_id
 
 # Contrôle d'accès à !pop : nom du rôle Discord qui autorise à envoyer des pops.
 # Tant que ce rôle n'existe PAS sur le serveur, tout le monde peut pop (comportement par défaut).
@@ -376,6 +394,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if did in ADMIN_IDS:
                         token = secrets.token_urlsafe(24)
                         ADMIN_TOKENS[token] = did
+                        save_admin_tokens()  # persiste -> survit au redémarrage serveur
                         payload["admin_token"] = token
                     try:
                         await websocket.send_json(payload)

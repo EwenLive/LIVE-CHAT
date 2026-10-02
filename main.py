@@ -173,7 +173,7 @@ class ConnectionManager:
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[websocket] = {"name": "Anonyme", "discord_id": None, "channels": {"general"}, "verified": False, "client_id": None}
+        self.active_connections[websocket] = {"name": "Anonyme", "discord_id": None, "channels": {"general"}, "verified": False, "client_id": None, "paused": False}
 
     def disconnect(self, websocket: WebSocket):
         self.active_connections.pop(websocket, None)
@@ -223,7 +223,7 @@ class ConnectionManager:
         # Snapshot : on copie avant d'itérer car _resolve fait un await (fetch_user)
         # pendant lequel une connexion peut se fermer et modifier le dict.
         entries = list(self.active_connections.values())
-        users = [await self._resolve(entry) for entry in entries]
+        users = [{**await self._resolve(entry), "paused": bool(entry.get("paused"))} for entry in entries]
         return sorted(users, key=lambda u: u["name"].lower())
 
     async def broadcast(self, message: dict):
@@ -354,6 +354,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 entry = manager.active_connections.get(websocket)
                 if entry is not None and cid:
                     entry["client_id"] = str(cid)
+                # État pause (si le client le renvoie au (re)connect)
+                if entry is not None and "paused" in data:
+                    entry["paused"] = bool(data.get("paused"))
                 await manager.broadcast_presence()
                 try:
                     await websocket.send_json(manager.channels_payload(websocket))  # is_admin à jour
@@ -368,6 +371,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     pass
             elif mtype == "subscribe":
                 manager.set_channels(websocket, data.get("channels", []))
+            elif mtype == "status":
+                # Le client signale son état pause (bot actif/en pause) -> visible par tous
+                entry = manager.active_connections.get(websocket)
+                if entry is not None:
+                    entry["paused"] = bool(data.get("paused"))
+                    await manager.broadcast_presence()
             elif mtype == "admin_channel":
                 entry = manager.active_connections.get(websocket, {})
                 if manager.is_admin(entry):

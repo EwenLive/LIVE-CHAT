@@ -42,7 +42,7 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 33  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 34  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
@@ -104,6 +104,8 @@ if not CURRENT_CLIENT_ID:
 # resynchro à la reconnexion : on re-joue mon vote si la coupure l'a fait perdre)
 CURRENT_ALERT_ID = ""
 CURRENT_MY_VOTE = 0
+# État pause du bot (local), partagé au serveur pour que les autres le voient dans la liste
+CURRENT_PAUSED = False
 
 # --- OAuth2 Discord ---
 DISCORD_CLIENT_ID = "1464725799205601320"   # = ID de l'application (le secret reste sur le serveur)
@@ -845,11 +847,15 @@ def _ws_send(payload):
 def send_hello(name):
     # Pousse le pseudo (+ ID Discord + jeton admin mémorisés) vers le serveur
     _ws_send({"type": "hello", "name": name, "discord_id": CURRENT_DISCORD_ID, "admin_token": CURRENT_ADMIN_TOKEN,
-              "client_id": CURRENT_CLIENT_ID, "alert_id": CURRENT_ALERT_ID})
+              "client_id": CURRENT_CLIENT_ID, "alert_id": CURRENT_ALERT_ID, "paused": CURRENT_PAUSED})
 
 def send_subscribe(channels):
     # Dit au serveur à quels salons on veut être abonné
     _ws_send({"type": "subscribe", "channels": channels})
+
+def send_status(paused):
+    # Signale au serveur si le bot est en pause (pour l'afficher chez les autres)
+    _ws_send({"type": "status", "paused": bool(paused)})
 
 def send_admin_channel(action, name):
     # Admin only : crée/supprime un salon
@@ -942,7 +948,7 @@ async def websocket_listener():
                 # alert_id = pop en cours -> le serveur renvoie son compte à jour = resynchro reconnexion)
                 await ws.send(json.dumps({"type": "hello", "name": CURRENT_USER, "discord_id": CURRENT_DISCORD_ID,
                                           "admin_token": CURRENT_ADMIN_TOKEN, "client_id": CURRENT_CLIENT_ID,
-                                          "alert_id": CURRENT_ALERT_ID}))
+                                          "alert_id": CURRENT_ALERT_ID, "paused": CURRENT_PAUSED}))
                 # On indique nos salons abonnés
                 await ws.send(json.dumps({"type": "subscribe", "channels": CURRENT_CHANNELS}))
                 # Si j'avais voté sur le pop en cours, je re-joue mon vote (une coupure a pu le perdre)
@@ -1352,10 +1358,13 @@ class ControlWindow(QWidget):
         threading.Thread(target=apply_update, daemon=True).start()
 
     def toggle_bot(self, state):
+        global CURRENT_PAUSED
         is_active = (state == 2) # 2 = Checked
         self.overlay.setEnabled(is_active)
         self.label_status.setText("Bot Actif" if is_active else "Bot en Pause")
         self.label_status.setStyleSheet("color: #a6e3a1;" if is_active else "color: #f38ba8;")
+        CURRENT_PAUSED = not is_active
+        send_status(CURRENT_PAUSED)  # informe le serveur -> visible par les autres
 
     def toggle_autostart(self, state):
         if not set_autostart(state == 2):
@@ -1529,16 +1538,21 @@ class ControlWindow(QWidget):
             if isinstance(u, dict):
                 name = u.get("name", "Anonyme")
                 avatar = u.get("avatar")
+                paused = bool(u.get("paused"))
             else:
                 name = u
                 avatar = None
+                paused = False
             suffix = "  (moi)" if name == CURRENT_USER else ""
-            item = QListWidgetItem(f"{name}{suffix}")
+            pause_mark = "  ⏸️" if paused else ""  # icône si la personne a mis LiveChat en pause
+            item = QListWidgetItem(f"{name}{suffix}{pause_mark}")
+            if paused:
+                item.setToolTip("LiveChat en pause")
             icon = self._avatar_icon(avatar)
             if icon is not None:
                 item.setIcon(icon)
             else:
-                item.setText(f"🟢  {name}{suffix}")  # Pastille verte si pas d'avatar
+                item.setText(f"🟢  {name}{suffix}{pause_mark}")  # Pastille verte si pas d'avatar
             self.users_list.addItem(item)
         self.label_connected.setText(f"Connectés ({len(users)})")
 

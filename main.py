@@ -106,6 +106,9 @@ app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")  # sert /med
 COOKIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 PUBLIC_BASE = os.getenv("PUBLIC_BASE", "https://srv1346932.hstgr.cloud")
 DIRECT_MEDIA_EXTS = (".mp4", ".mov", ".avi", ".webm", ".gif", ".png", ".jpg", ".jpeg", ".webp")
+# PO token provider (bgutil) : fournit à yt-dlp le jeton "preuve d'origine" exigé par YouTube
+# sur les IP de serveur -> contourne l'erreur "Sign in to confirm you're not a bot".
+POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "http://bgutil-provider:4416")
 _download_sem = asyncio.Semaphore(2)  # max 2 téléchargements simultanés (VPS 1 cœur)
 
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
@@ -429,6 +432,14 @@ async def download_media(url: str, alert_id: str):
         cmd += ["--match-filter", "duration <= 5400"]  # max 90 min (sauf TikTok)
     if os.path.exists(COOKIES_PATH):
         cmd += ["--cookies", COOKIES_PATH]
+    # YouTube : on passe par le PO token provider (bgutil) + clients "web" qui utilisent ces tokens
+    # (le client par défaut "visionos/tv" ne demande pas de PO token -> se fait bloquer).
+    is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+    if is_youtube and POT_PROVIDER_URL:
+        cmd += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
+        # yt-dlp essaie les clients dans l'ordre : défaut (OK pour vidéos normales) puis les clients
+        # "web" à PO token en secours (nécessaires pour les Shorts / contenus bloqués).
+        cmd += ["--extractor-args", "youtube:player_client=default,web_safari,tv,mweb"]
     cmd.append(url)
     async with _download_sem:
         try:
@@ -592,11 +603,13 @@ async def cleanup_media_task():
         await asyncio.sleep(300)  # toutes les 5 min
 
 async def ytdlp_updater_task():
-    # Met yt-dlp à jour au démarrage puis chaque jour (YouTube s'auto-répare)
+    # Met yt-dlp à jour au démarrage puis chaque jour (YouTube s'auto-répare).
+    # Canal NIGHTLY (--pre) : les correctifs YouTube (ex: PO token GVS) y arrivent en premier,
+    # la version stable est souvent trop en retard pour contourner l'anti-bot.
     while True:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "pip", "install", "-U", "yt-dlp",
+                "pip", "install", "-U", "--pre", "yt-dlp[default]",
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
             await proc.wait()

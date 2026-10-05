@@ -42,7 +42,7 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 35  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 36  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
@@ -1679,6 +1679,11 @@ if __name__ == "__main__":
     tray_icon.setContextMenu(menu)
 
     tray_icon.show()
+
+    # Auto-répare le démarrage Windows : ré-ancre le chemin courant de l'exe dans la clé Run
+    # (si l'exe a été déplacé/renommé, l'ancienne entrée pointait dans le vide -> ne démarrait plus).
+    if is_autostart_enabled():
+        set_autostart(True)
 
     threading.Thread(target=check_update_startup, daemon=True).start()  # MAJ dispo au lancement -> bouton
     threading.Thread(target=update_watcher, daemon=True).start()        # vérifie en continu -> bouton

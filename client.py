@@ -42,7 +42,7 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 34  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 35  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
@@ -802,13 +802,14 @@ def apply_update():
         log(f"MAJ échouée: {e}")
 
 def check_update_startup():
-    # Au lancement : s'il existe une version plus récente, on prévient l'UI (bouton), sans relance surprise.
+    # Au lancement : s'il existe une version plus récente, on l'installe AUTO (relance propre via .bat,
+    # plus d'erreur Python). Au lancement = pas "en plein jeu", donc OK d'auto-relancer.
     if not getattr(sys, "frozen", False):
         return
     latest = _get_latest_version()
     if latest and latest > APP_VERSION:
-        log(f"⬆️ MAJ dispo au lancement : v{latest} (actuelle v{APP_VERSION})")
-        comm.update_available.emit(latest)
+        log(f"⬆️ MAJ au lancement : v{latest} (actuelle v{APP_VERSION}) -> installation auto")
+        apply_update()
 
 def update_watcher():
     # Pendant que l'app tourne : vérifie toutes les 5 min -> signale un bouton si une MAJ sort.
@@ -955,11 +956,18 @@ async def websocket_listener():
                 if CURRENT_ALERT_ID and CURRENT_MY_VOTE:
                     await ws.send(json.dumps({"type": "vote", "alert_id": CURRENT_ALERT_ID, "value": CURRENT_MY_VOTE}))
 
+                last_pong = [time.monotonic()]  # dernier signe de vie du SERVEUR (pas juste du proxy)
+
                 async def _heartbeat(sock):
-                    # Heartbeat applicatif : garde la connexion active ET détecte une socket morte
+                    # Heartbeat applicatif + WATCHDOG : si le serveur ne répond plus depuis 50s
+                    # (connexion "à moitié morte" que le proxy garde ouverte) -> on force la reconnexion.
                     try:
                         while True:
-                            await asyncio.sleep(25)
+                            await asyncio.sleep(20)
+                            if time.monotonic() - last_pong[0] > 50:
+                                log("⚠️ Serveur silencieux depuis 50s -> reconnexion forcée")
+                                await sock.close()
+                                return
                             await sock.send(json.dumps({"type": "ping"}))
                     except Exception:
                         pass  # la boucle de réception gérera la reconnexion
@@ -967,8 +975,11 @@ async def websocket_listener():
 
                 while True:
                     msg = await ws.recv()
+                    last_pong[0] = time.monotonic()  # tout message reçu = le serveur est vivant
                     data = json.loads(msg)
                     mtype = data.get("type")
+                    if mtype == "pong":
+                        continue  # réponse au heartbeat, rien à faire de plus
                     if mtype == "presence":
                         comm.presence.emit(data.get("users", []))
                     elif mtype == "roster":

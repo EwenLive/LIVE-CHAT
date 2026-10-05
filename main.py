@@ -371,6 +371,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     pass
             elif mtype == "subscribe":
                 manager.set_channels(websocket, data.get("channels", []))
+            elif mtype == "ping":
+                # Heartbeat applicatif : on répond pong -> le client sait que le SERVEUR (pas juste
+                # le proxy) est vivant. S'il ne reçoit plus de pong, il force une reconnexion.
+                try:
+                    await websocket.send_json({"type": "pong"})
+                except Exception:
+                    pass
             elif mtype == "status":
                 # Le client signale son état pause (bot actif/en pause) -> visible par tous
                 entry = manager.active_connections.get(websocket)

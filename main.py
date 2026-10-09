@@ -20,8 +20,26 @@ TOKEN = str(os.getenv("DISCORD_TOKEN"))
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1464725799205601320").strip().strip('"').strip("'")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip().strip('"').strip("'")
 
-# Salon Discord autorisé pour la commande !pop (0 = pas de restriction)
+# Salon Discord autorisé pour la commande !pop.
+# Multi-serveur : on autorise tout salon dont le NOM normalisé == MEDIA_CHANNEL_NAME (ex "média"->"media"),
+# + (rétro-compat) l'ancien salon par ID. Marche ainsi sur Daoud ET la Kex sans config par-serveur.
 MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID", "1464726876604862528"))
+
+def _norm_name(s: str) -> str:
+    # minuscule + sans accents + que les lettres/chiffres (pour comparer des noms de salons)
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode()
+    return "".join(c for c in s.lower() if c.isalnum())
+
+MEDIA_CHANNEL_NAME = _norm_name(os.getenv("MEDIA_CHANNEL_NAME", "media"))
+
+def is_media_channel(ch) -> bool:
+    try:
+        if MEDIA_CHANNEL_ID and ch.id == MEDIA_CHANNEL_ID:
+            return True
+        return _norm_name(getattr(ch, "name", "")) == MEDIA_CHANNEL_NAME
+    except Exception:
+        return False
 
 # --- Salons (channels) LiveChat : chaque client s'abonne à un ou plusieurs salons ---
 CHANNELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channels.json")
@@ -491,8 +509,8 @@ async def _twitter_image(url: str):
 @bot.command()
 async def pop(ctx, *, texte: str = ""):
     # Restriction : !pop autorisé uniquement dans le salon média
-    if MEDIA_CHANNEL_ID and ctx.channel.id != MEDIA_CHANNEL_ID:
-        await ctx.send(f"⚠️ Les `!pop` se font uniquement dans <#{MEDIA_CHANNEL_ID}>.", delete_after=6)
+    if not is_media_channel(ctx.channel):
+        await ctx.send("⚠️ Les `!pop` se font uniquement dans le salon **média**.", delete_after=6)
         return
 
     # Contrôle d'accès : seuls les membres avec le rôle « livechat » (+ admins) peuvent envoyer des pops
@@ -584,6 +602,91 @@ async def status(ctx):
         f"🟢 LiveChat en ligne — **{len(conns)}** client(s) connecté(s) : {names}\n"
         f"🔐 Accès !pop : {acces}"
     )
+
+TUTO_MESSAGE = f"""# 🎬 LiveChat — comment ça marche
+
+**LiveChat** affiche un média (vidéo, image, gif, lien YouTube/TikTok/Insta…) **en plein écran chez tout le monde** quand quelqu'un le « pop » depuis Discord.
+
+## 1️⃣ Installer le client
+• Télécharge l'appli : {PUBLIC_BASE}/download
+• Lance **LiveChat.exe** (mets-le dans un dossier stable — pas dans un .zip).
+• Une petite icône apparaît en bas à droite (⚠️ parfois dans les icônes cachées **^**).
+
+## 2️⃣ Se connecter
+• Clique sur l'icône → **« Se connecter avec Discord »** (récupère ton pseudo + ta photo auto).
+• Coche les **salons** que tu veux recevoir.
+
+## 3️⃣ Envoyer un pop
+Dans le salon **#média**, tape :
+`!pop <lien ou fichier>`
+Exemples :
+• `!pop https://youtube.com/watch?v=...`
+• `!pop` + une image/vidéo en pièce jointe
+• `!pop fm <lien>` → cible le salon **fm**
+→ Le média s'affiche en plein écran chez tous ceux qui ont LiveChat ouvert. 🎉
+
+## 4️⃣ Voter 👍 / 👎
+Pendant un pop, des boutons 👍/👎 apparaissent en bas à droite. Vote → la pp du votant monte façon TikTok, et le compteur est visible par tous.
+
+## ⚙️ Divers
+• **Pause** : bouton on/off (les autres voient un ⏸️ à côté de ton nom).
+• **Écran** : choisis sur quel écran les pops s'affichent.
+• **Mises à jour** : automatiques au lancement.
+• **Accès** : si un rôle **livechat** existe sur le serveur, il faut l'avoir pour `!pop` (demande à un admin).
+
+Amusez-vous bien ! 🚀"""
+
+async def _send_long(channel, text):
+    # Discord limite à 2000 caractères -> on découpe proprement si besoin
+    while text:
+        if len(text) <= 1990:
+            await channel.send(text)
+            return
+        cut = text.rfind("\n", 0, 1990)
+        if cut < 500:
+            cut = 1990
+        await channel.send(text[:cut])
+        text = text[cut:].lstrip("\n")
+
+@bot.command()
+async def setup(ctx):
+    # Admin : crée la catégorie LiveChat + salons média/release/tuto + poste le Tuto (bot = "Gérer les salons")
+    if str(ctx.author.id) not in ADMIN_IDS:
+        await ctx.send("⛔ Réservé à l'admin.", delete_after=5)
+        return
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("⚠️ À lancer depuis un serveur.", delete_after=6)
+        return
+    if not guild.me.guild_permissions.manage_channels:
+        await ctx.send("⚠️ Il me manque la permission **Gérer les salons** — ré-invite-moi avec cette permission.", delete_after=12)
+        return
+    cat = discord.utils.find(lambda c: _norm_name(c.name) == "livechat", guild.categories)
+    if cat is None:
+        cat = await guild.create_category("LiveChat")
+    chans, created = {}, set()
+    for cname in ("média", "release", "tuto"):
+        n = _norm_name(cname)
+        existing = discord.utils.find(lambda c, nn=n: _norm_name(c.name) == nn, guild.text_channels)
+        if existing is None:
+            existing = await guild.create_text_channel(cname, category=cat)
+            created.add(n)
+        chans[n] = existing
+    if "tuto" in created:  # on ne poste le tuto qu'à la création (évite les doublons ; sinon !tuto)
+        await _send_long(chans["tuto"], TUTO_MESSAGE)
+    txt = f"✅ Setup OK sur **{guild.name}** ! Catégorie **LiveChat** prête."
+    if created:
+        txt += f" (créés : {', '.join(sorted(created))})"
+    txt += f"\nLes `!pop` se font dans {chans['media'].mention} · Tuto dans {chans['tuto'].mention}."
+    await ctx.send(txt)
+
+@bot.command()
+async def tuto(ctx):
+    # Admin : (re)poste le message d'explication dans le salon courant
+    if str(ctx.author.id) not in ADMIN_IDS:
+        await ctx.send("⛔ Réservé à l'admin.", delete_after=5)
+        return
+    await _send_long(ctx.channel, TUTO_MESSAGE)
 
 @app.get("/version")
 async def get_version():

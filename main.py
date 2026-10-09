@@ -226,10 +226,27 @@ class ConnectionManager:
         if cached and (time.time() - cached[0]) < AVATAR_TTL:
             return cached[1]
         try:
-            user = await bot.fetch_user(int(discord_id))
+            uid = int(discord_id)
+            # On cherche le MEMBRE dans les serveurs du bot pour prendre l'avatar SPÉCIFIQUE au serveur
+            # (member.display_avatar = pp du serveur si définie, sinon globale) — comme la pp de l'auteur
+            # en haut à gauche. bot.fetch_user ne renvoie QUE l'avatar global, d'où l'incohérence.
+            member = None
+            for g in bot.guilds:
+                m = g.get_member(uid)
+                if m is not None:
+                    member = m
+                    if m.guild_avatar is not None:  # avatar propre à CE serveur -> on le préfère
+                        break
+            if member is not None:
+                name = member.global_name or member.name
+                avatar = member.display_avatar
+            else:
+                user = await bot.fetch_user(uid)
+                name = user.global_name or user.name
+                avatar = user.display_avatar
             info = {
-                "name": user.global_name or user.name,
-                "avatar": str(user.display_avatar.replace(size=64, static_format="png").url),
+                "name": name,
+                "avatar": str(avatar.replace(size=64, static_format="png").url),
             }
             self._avatar_cache[discord_id] = (time.time(), info)  # (timestamp, info)
             return info

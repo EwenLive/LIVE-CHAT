@@ -196,6 +196,17 @@ class ConnectionManager:
     def disconnect(self, websocket: WebSocket):
         self.active_connections.pop(websocket, None)
 
+    async def _drop(self, websocket: WebSocket):
+        # Retire ET ferme la socket. Évite les connexions "fantômes" : retirées de la liste
+        # (après un envoi échoué) mais socket encore ouverte -> le client croit être connecté,
+        # reçoit encore les pong, mais ne reçoit plus aucun pop -> bloqué, obligé de relancer.
+        # En fermant, le client détecte la coupure et se reconnecte proprement (hello + subscribe).
+        self.disconnect(websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
     def set_identity(self, websocket: WebSocket, name=None, discord_id=None, verified=None):
         entry = self.active_connections.get(websocket)
         if entry is None:
@@ -268,9 +279,9 @@ class ConnectionManager:
                 await connection.send_json(message)
             except:  # noqa: E722
                 dead.append(connection)
-        # Nettoie les connexions mortes pour éviter qu'elles bloquent les diffusions
+        # Nettoie les connexions mortes (et ferme la socket -> pas de connexion fantôme)
         for connection in dead:
-            self.disconnect(connection)
+            await self._drop(connection)
 
     async def broadcast_presence(self):
         await self.broadcast({"type": "presence", "users": await self.get_users()})
@@ -294,7 +305,7 @@ class ConnectionManager:
                 except:  # noqa: E722
                     dead.append(ws)
         for ws in dead:
-            self.disconnect(ws)
+            await self._drop(ws)
 
     def channels_payload(self, websocket: WebSocket) -> dict:
         entry = self.active_connections.get(websocket, {})

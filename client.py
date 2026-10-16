@@ -42,7 +42,7 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 36  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 37  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
@@ -813,13 +813,16 @@ def check_update_startup():
 
 def update_watcher():
     # Pendant que l'app tourne : vérifie toutes les 5 min -> signale un bouton si une MAJ sort.
+    # On ne notifie QU'UNE fois par version (évite le spam de notif toutes les 5 min).
     if not getattr(sys, "frozen", False):
         return
+    notified = APP_VERSION
     while True:
         time.sleep(300)
         latest = _get_latest_version()
-        if latest and latest > APP_VERSION:
+        if latest and latest > notified:
             comm.update_available.emit(latest)
+            notified = latest
 
 def make_ssl_context():
     # On force l'utilisation du magasin de certificats fourni par 'certifi' (toujours à jour)

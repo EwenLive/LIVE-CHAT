@@ -42,7 +42,7 @@ SERVER_WS_URL = "wss://srv1346932.hstgr.cloud/ws"  # VPS Hostinger (Traefik + Le
 IMAGE_DURATION = 5000
 
 # --- AUTO-UPDATE ---
-APP_VERSION = 37  # version interne de ce build (le serveur annonce la dernière dispo)
+APP_VERSION = 38  # version interne de ce build (le serveur annonce la dernière dispo)
 UPDATE_BASE = "https://srv1346932.hstgr.cloud"
 
 # --- PSEUDO / CONFIG LOCALE ---
@@ -290,6 +290,15 @@ class Overlay(QWidget):
         self.player.setAudioOutput(self.audio)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
 
+        # Garde-fou de lecture : débloque la file si une vidéo stalle ou ne se termine jamais
+        # (sinon is_playing reste coincé -> overlay figé : "reste allumé mais plus rien ne s'affiche",
+        #  typiquement quand plusieurs vidéos arrivent en même temps et qu'une charge mal).
+        self._last_pos = 0
+        self.play_guard = QTimer()
+        self.play_guard.setSingleShot(True)
+        self.play_guard.timeout.connect(self._playback_guard_fired)
+        self.player.positionChanged.connect(self._on_position_changed)
+
         self.image_timer = QTimer()
         self.image_timer.setSingleShot(True)
         self.image_timer.timeout.connect(self._on_alert_finished)
@@ -339,6 +348,18 @@ class Overlay(QWidget):
             self.show_all()
         if status in (QMediaPlayer.MediaStatus.EndOfMedia, QMediaPlayer.MediaStatus.InvalidMedia):
             self._on_alert_finished()
+
+    def _on_position_changed(self, pos):
+        # Tant que la vidéo AVANCE, on réarme le garde-fou. 15s sans progrès = figée -> on débloque.
+        if pos > self._last_pos:
+            self._last_pos = pos
+            if self.is_playing:
+                self.play_guard.start(15000)
+
+    def _playback_guard_fired(self):
+        # Vidéo bloquée (stall au chargement, ou fin jamais signalée) -> on passe au pop suivant
+        print("⏱️ Garde-fou lecture : média figé, on débloque la file")
+        self._on_alert_finished()
 
     def set_screen(self, screen):
         # Définit le moniteur sur lequel l'overlay s'affichera
@@ -531,12 +552,14 @@ class Overlay(QWidget):
     def display_video(self, path):
         self.image_label.hide()
         self.video_widget.show()
+        self._last_pos = 0
         # URL distante (serveur/Discord) -> streaming ; sinon fichier local
         if path.startswith("http://") or path.startswith("https://"):
             self.player.setSource(QUrl(path))
         else:
             self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
+        self.play_guard.start(25000)  # garde-fou : si la vidéo ne démarre pas en 25s -> on débloque
 
     def hide_overlay(self):
         if self.player.source().isLocalFile():
@@ -558,6 +581,7 @@ class Overlay(QWidget):
             QTimer.singleShot(500, lambda: self._delete_file(path_to_del))
             
         self.image_timer.stop()
+        self.play_guard.stop()  # coupe le garde-fou de lecture (sinon il viserait le pop suivant)
         self._topmost_timer.stop()  # on arrête de forcer le 1er plan quand le pop est fini
         self.image_label.clear()
         self.user_label.setText("") # Reset le pseudo

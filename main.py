@@ -196,16 +196,31 @@ class ConnectionManager:
     def disconnect(self, websocket: WebSocket):
         self.active_connections.pop(websocket, None)
 
-    async def _drop(self, websocket: WebSocket):
-        # Retire ET ferme la socket. Évite les connexions "fantômes" : retirées de la liste
-        # (après un envoi échoué) mais socket encore ouverte -> le client croit être connecté,
-        # reçoit encore les pong, mais ne reçoit plus aucun pop -> bloqué, obligé de relancer.
-        # En fermant, le client détecte la coupure et se reconnecte proprement (hello + subscribe).
-        self.disconnect(websocket)
+    async def _send_one(self, ws, message):
+        # Envoi BORNÉ dans le temps : un client lent ou "à moitié mort" ne doit JAMAIS bloquer la
+        # diffusion aux autres (sinon un seul client dégradé gèle les pops pour TOUT LE MONDE).
         try:
-            await websocket.close()
+            await asyncio.wait_for(ws.send_json(message), timeout=5)
+            return None
+        except Exception:
+            return ws  # mort/trop lent -> à retirer
+
+    async def _close_quietly(self, websocket):
+        try:
+            await asyncio.wait_for(websocket.close(), timeout=3)
         except Exception:
             pass
+
+    def _cleanup(self, results):
+        # Retire les connexions mortes (sync, immédiat) et ferme leur socket en arrière-plan
+        # (le close ne doit pas bloquer la diffusion) -> le client détecte la coupure et se reconnecte.
+        for ws in results:
+            if ws is not None:
+                self.disconnect(ws)
+                try:
+                    asyncio.create_task(self._close_quietly(ws))
+                except Exception:
+                    pass
 
     def set_identity(self, websocket: WebSocket, name=None, discord_id=None, verified=None):
         entry = self.active_connections.get(websocket)
@@ -273,15 +288,12 @@ class ConnectionManager:
         return sorted(users, key=lambda u: u["name"].lower())
 
     async def broadcast(self, message: dict):
-        dead = []
-        for connection in list(self.active_connections.keys()):
-            try:
-                await connection.send_json(message)
-            except:  # noqa: E722
-                dead.append(connection)
-        # Nettoie les connexions mortes (et ferme la socket -> pas de connexion fantôme)
-        for connection in dead:
-            await self._drop(connection)
+        conns = list(self.active_connections.keys())
+        if not conns:
+            return
+        # Envoi CONCURRENT à tous : un client lent n'empêche pas les autres de recevoir le pop.
+        results = await asyncio.gather(*[self._send_one(c, message) for c in conns])
+        self._cleanup(results)
 
     async def broadcast_presence(self):
         await self.broadcast({"type": "presence", "users": await self.get_users()})
@@ -297,15 +309,12 @@ class ConnectionManager:
         entry["channels"] = chosen or {"general"}
 
     async def broadcast_to_channel(self, channel: str, message: dict):
-        dead = []
-        for ws, entry in list(self.active_connections.items()):
-            if channel in entry.get("channels", set()):
-                try:
-                    await ws.send_json(message)
-                except:  # noqa: E722
-                    dead.append(ws)
-        for ws in dead:
-            await self._drop(ws)
+        targets = [ws for ws, e in list(self.active_connections.items()) if channel in e.get("channels", set())]
+        if not targets:
+            return
+        # Envoi CONCURRENT aux abonnés du salon (idem : un client lent ne bloque pas les autres).
+        results = await asyncio.gather(*[self._send_one(c, message) for c in targets])
+        self._cleanup(results)
 
     def channels_payload(self, websocket: WebSocket) -> dict:
         entry = self.active_connections.get(websocket, {})
